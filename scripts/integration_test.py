@@ -11,6 +11,7 @@
   6. 慢上传期间另一实例仍可接收与查询（不阻塞）
   7. 配额不足 507
   8. 崩溃回收：伪造孤儿暂存后调 /admin/reconcile 被清理
+  9. 站日目录/采纳：候选、版本乐观锁、删除失效、同号重入湖须重采纳、双实例交错
 """
 
 from __future__ import annotations
@@ -230,6 +231,114 @@ def main() -> int:
     check("失败记录保持 UPLOADING 可重传",
           states.get("IT-BADLEN") == "UPLOADING"
           and states.get("IT-BADPARQUET") == "UPLOADING", str(states))
+
+    print("== 9. 站日目录 / 采纳（双实例交错） ==")
+    station, day = "BUOY-CAT", "2026-11-15"
+    cands_path = f"/catalogs/stations/{station}/days/{day}/candidates"
+    cat_path = f"/catalogs/stations/{station}/days/{day}"
+    adopt_path = f"/catalogs/stations/{station}/days/{day}/adoptions"
+
+    # 初始 VACANT / version=0
+    code, body, _ = req("GET", BASE1, cat_path)
+    cat0 = json.loads(body)
+    check("新站日目录 VACANT 且版本 0",
+          code == 200 and cat0["state"] == "VACANT" and cat0["version"] == 0, str(cat0))
+
+    # 两份候选分别在两个实例发布
+    dc1, shac1 = make_parquet("cat1.parquet", station=station, salt=0.1)
+    dc2, shac2 = make_parquet("cat2.parquet", station=station, salt=0.2)
+    for rid, d, sh, base in (("IT-C1", dc1, shac1, BASE1), ("IT-C2", dc2, shac2, BASE2)):
+        req("PUT", base, f"/receipts/{rid}/declaration",
+            decl(rid, d, sh, station_id=station))
+        code, body, _ = req("POST", base, f"/receipts/{rid}/content", d, raw=True)
+        check(f"{rid} 发布成功", code == 200 and json.loads(body)["state"] == "PUBLISHED")
+
+    # 候选显示接收号、摘要、行数
+    code, body, _ = req("GET", BASE2, cands_path)
+    clist = json.loads(body)
+    ids = [c["receipt_id"] for c in clist["candidates"]]
+    check("候选含两份已发布接收且带摘要/行数",
+          ids == ["IT-C1", "IT-C2"]
+          and all(c["declared_sha256"] and c["row_count"] == 24 for c in clist["candidates"]),
+          str(clist))
+    version_after_publish = clist["version"]
+    check("发布两次后目录版本推进到 2", version_after_publish == 2, str(version_after_publish))
+
+    # 旧版本采纳被拒且不改选择
+    code, body, _ = req("POST", BASE1, adopt_path,
+                        {"receipt_id": "IT-C2", "expected_version": 0})
+    check("过期版本采纳 409", code == 409
+          and json.loads(body)["error"]["code"] == "catalog_version_conflict")
+    check("被拒后目录仍 VACANT",
+          req("GET", BASE2, cat_path)[1] and json.loads(req("GET", BASE2, cat_path)[1])["state"] == "VACANT")
+
+    # 正确版本采纳 C1
+    code, body, _ = req("POST", BASE2, adopt_path,
+                        {"receipt_id": "IT-C1", "expected_version": version_after_publish})
+    adopted = json.loads(body)
+    check("采纳成功目录 ACTIVE",
+          code == 200 and adopted["state"] == "ACTIVE"
+          and adopted["adopted_receipt_id"] == "IT-C1"
+          and adopted["adopted_seq"] == 1, str(adopted))
+
+    # 实例1 立刻看到实例2 的采纳
+    code, body, _ = req("GET", BASE1, cat_path)
+    check("采纳跨实例可见", json.loads(body)["adopted_receipt_id"] == "IT-C1")
+
+    # 不能采纳未发布接收
+    d_up, sh_up = make_parquet("catup.parquet", station=station, salt=0.9)
+    req("PUT", BASE1, "/receipts/IT-CUP/declaration",
+        decl("IT-CUP", d_up, sh_up, station_id=station))
+    cur_v = json.loads(req("GET", BASE1, cat_path)[1])["version"]
+    code, body, _ = req("POST", BASE1, adopt_path,
+                        {"receipt_id": "IT-CUP", "expected_version": cur_v})
+    check("采纳未发布接收 409", code == 409
+          and json.loads(body)["error"]["code"] == "adopt_not_published")
+
+    # 删除正式接收 → INVALID，不自动改选
+    code, _, _ = req("DELETE", BASE1, "/receipts/IT-C1")
+    check("删除正式接收 204", code == 204)
+    code, body, _ = req("GET", BASE2, cat_path)
+    invalid = json.loads(body)
+    check("正式接收被删目录 INVALID 且保留快照",
+          invalid["state"] == "INVALID" and invalid["adopted_receipt_id"] == "IT-C1"
+          and "删除" in (invalid["invalid_reason"] or ""), str(invalid))
+    check("失效后候选只剩 IT-C2 且未被自动选中",
+          [c["receipt_id"] for c in json.loads(req("GET", BASE1, cands_path)[1])["candidates"]]
+          == ["IT-C2"])
+
+    # 同号重新入湖（同摘要）也必须重新采纳
+    req("PUT", BASE2, "/receipts/IT-C1/declaration",
+        decl("IT-C1", dc1, shac1, station_id=station))
+    code, body, _ = req("POST", BASE2, "/receipts/IT-C1/content", dc1, raw=True)
+    check("同号同摘要重新入湖发布成功", code == 200)
+    clist2 = json.loads(req("GET", BASE1, cands_path)[1])
+    re_row = next(c for c in clist2["candidates"] if c["receipt_id"] == "IT-C1")
+    check("重新入湖代次 seq=2 且目录仍 INVALID",
+          re_row["seq"] == 2 and clist2["catalog_state"] == "INVALID", str(clist2))
+
+    # 用当前版本显式重新采纳 → 恢复 ACTIVE，adopted_seq=2
+    cur_v = json.loads(req("GET", BASE2, cat_path)[1])["version"]
+    code, body, _ = req("POST", BASE1, adopt_path,
+                        {"receipt_id": "IT-C1", "expected_version": cur_v})
+    readopted = json.loads(body)
+    check("重新采纳恢复 ACTIVE 且代次为 2",
+          code == 200 and readopted["state"] == "ACTIVE"
+          and readopted["adopted_seq"] == 2, str(readopted))
+
+    # 对账：删掉正式接收的共享原件 → 目录 INVALID（双实例均可见，不复活）
+    blob = pathlib.Path(os.environ["OBS_DATA_DIR"]) / "blobs" / shac1[:2] / shac1
+    blob.unlink()
+    code, body, _ = req("POST", BASE2, "/admin/reconcile")
+    check("对账执行成功", code == 200)
+    view1 = json.loads(req("GET", BASE1, cat_path)[1])
+    view2 = json.loads(req("GET", BASE2, cat_path)[1])
+    check("缺件对账后两实例均见 INVALID",
+          view1["state"] == "INVALID" and view2["state"] == "INVALID"
+          and "共享原件" in (view1["invalid_reason"] or ""), f"{view1} | {view2}")
+    check("失效接收不再出现在候选",
+          all(c["receipt_id"] != "IT-C1"
+              for c in json.loads(req("GET", BASE1, cands_path)[1])["candidates"]))
 
     print(f"\n结果：{PASS} 通过 / {FAIL} 失败")
     return 1 if FAIL else 0

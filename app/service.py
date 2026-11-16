@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
+from . import catalog as cat
 from .config import Settings
 from .db import Database
 from .errors import (
@@ -103,7 +104,7 @@ def declare_receipt(settings: Settings, db: Database, decl: DeclarationIn) -> di
             )
         conn.execute(
             "INSERT INTO receipts(receipt_id, station_id, obs_date, declared_size, "
-            "declared_sha256, state) VALUES (?, ?, ?, ?, ?, ?)",
+            "declared_sha256, state, seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 decl.receipt_id,
                 decl.station_id,
@@ -111,8 +112,11 @@ def declare_receipt(settings: Settings, db: Database, decl: DeclarationIn) -> di
                 decl.size,
                 decl.sha256,
                 _UPLOADING,
+                cat.allocate_generation(conn, decl.receipt_id),
             ),
         )
+        # 预建站日目录行（VACANT/version=0），下游在首个候选发布前即可查询
+        cat.ensure_catalog_row(conn, decl.station_id, decl.obs_date.isoformat())
         return _row_to_dict(
             conn.execute(
                 "SELECT * FROM receipts WHERE receipt_id = ?", (decl.receipt_id,)
@@ -249,6 +253,11 @@ def _publish(settings: Settings, db: Database, receipt: dict) -> dict:
                 "WHERE receipt_id = ?",
                 (sha, result.row_count, receipt_id),
             )
+            if row["state"] != _PUBLISHED:
+                # 新候选进入站日：目录版本 +1（旧版本采纳提交此后将被拒绝）
+                cat.bump_catalog_version(
+                    conn, row["station_id"], row["obs_date"]
+                )
             published = _row_to_dict(
                 conn.execute(
                     "SELECT * FROM receipts WHERE receipt_id = ?", (receipt_id,)
@@ -415,7 +424,13 @@ def abort_receipt(settings: Settings, db: Database, receipt_id: str) -> dict:
 
 
 def delete_receipt(settings: Settings, db: Database, receipt_id: str) -> None:
-    """删除接收记录；若为唯一引用则成品 blob 一并回收。"""
+    """删除接收记录；若为唯一引用则成品 blob 一并回收。
+
+    对站日目录的影响（同一写事务内完成，双实例交错也不会漏标）：
+    - 删除已发布接收 → 候选集变化，目录版本 +1；
+    - 若它正是当前正式接收 → 目录置 INVALID（不自动改选，须人工重新采纳）；
+      同号之后重新入湖时代次 +1，旧采纳同样不会复活。
+    """
     with global_lock(settings):
         with try_receipt_lock(settings, receipt_id):
             with db.transaction() as conn:
@@ -436,9 +451,81 @@ def delete_receipt(settings: Settings, db: Database, receipt_id: str) -> None:
                     if blob is not None and blob["ref_count"] == 0:
                         safe_remove(blob_path(settings, sha))
                         conn.execute("DELETE FROM blobs WHERE sha256 = ?", (sha,))
+
+                    catalog = conn.execute(
+                        "SELECT * FROM catalogs WHERE station_id = ? AND obs_date = ?",
+                        (row["station_id"], row["obs_date"]),
+                    ).fetchone()
+                    is_adopted = (
+                        catalog is not None
+                        and catalog["state"] == cat.ACTIVE
+                        and catalog["adopted_receipt_id"] == receipt_id
+                        and int(catalog["adopted_seq"]) == int(row["seq"])
+                    )
+                    if is_adopted:
+                        cat.mark_catalog_invalid(
+                            conn,
+                            row["station_id"],
+                            row["obs_date"],
+                            f"正式接收 {receipt_id} 已被删除，目录失效，需重新采纳",
+                        )
+                    else:
+                        # 仅候选集变化（含 VACANT/INVALID 目录）：版本 +1
+                        cat.bump_catalog_version(
+                            conn, row["station_id"], row["obs_date"]
+                        )
+
                 conn.execute("DELETE FROM receipts WHERE receipt_id = ?", (receipt_id,))
             safe_remove(staging_path(settings, receipt_id))
 
 
 def get_quota(settings: Settings, db: Database) -> dict:
     return current_usage(settings, db)
+
+
+# ---------------------------------------------------------------------------
+# 站日目录 / 采纳
+# ---------------------------------------------------------------------------
+
+def _validate_day(obs_date: str) -> str:
+    """校验路径日期是真实日历日期（FastAPI 已保证 YYYY-MM-DD 形状）。"""
+    try:
+        dt.date.fromisoformat(obs_date)
+    except ValueError as exc:
+        raise ObsError(
+            f"观测日期 {obs_date!r} 不是合法日历日期，应为 YYYY-MM-DD",
+            code="validation_error",
+            status_code=422,
+        ) from exc
+    return obs_date
+
+
+def list_catalog_candidates(
+    db: Database, station_id: str, obs_date: str
+) -> list[dict]:
+    """站日候选目录：接收号、摘要、行数（仅当前仍已发布的接收）。"""
+    _validate_day(obs_date)
+    return cat.list_candidates(db, station_id, obs_date)
+
+
+def get_station_day_catalog(
+    settings: Settings, db: Database, station_id: str, obs_date: str
+) -> dict:
+    """正式目录查询（含读取时失效自愈核对）。"""
+    _validate_day(obs_date)
+    return cat.get_catalog(db, settings, station_id, obs_date)
+
+
+def adopt_station_day_receipt(
+    settings: Settings,
+    db: Database,
+    station_id: str,
+    obs_date: str,
+    receipt_id: str,
+    expected_version: int,
+) -> dict:
+    """采纳正式原包：校验站日、发布状态与目录版本，旧版本提交拒绝且不改选择。"""
+    _validate_day(obs_date)
+    return cat.adopt(
+        db, settings, station_id, obs_date, receipt_id, expected_version
+    )

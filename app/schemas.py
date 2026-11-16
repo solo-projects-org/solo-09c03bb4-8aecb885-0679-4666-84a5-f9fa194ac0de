@@ -73,3 +73,49 @@ class ReconcileOut(BaseModel):
     removed_staging_files: int
     removed_orphan_blobs: int
     reset_receipts: int
+
+
+# ---------------------------------------------------------------------------
+# 站日目录 / 采纳
+# ---------------------------------------------------------------------------
+
+class CandidateOut(BaseModel):
+    """站日候选接收：接收号、摘要与行数（仅当前仍已发布）。"""
+
+    receipt_id: str
+    seq: int = Field(..., description="入湖代次；同号删除后重新入湖代次递增")
+    station_id: str
+    obs_date: str
+    declared_size: int
+    declared_sha256: str
+    blob_sha256: str | None
+    row_count: int | None
+    created_at: str
+    updated_at: str
+
+
+class CandidateListOut(BaseModel):
+    station_id: str
+    obs_date: str
+    version: int = Field(..., description="查询时刻的目录版本，采纳时须原样回传")
+    catalog_state: str = Field(..., description="VACANT / ACTIVE / INVALID")
+    candidates: list[CandidateOut]
+
+
+class CatalogOut(BaseModel):
+    station_id: str
+    obs_date: str
+    version: int
+    state: str = Field(..., description="VACANT 未采纳 / ACTIVE 有效 / INVALID 失效待重选")
+    adopted_receipt_id: str | None
+    adopted_seq: int | None
+    adopted_sha256: str | None
+    invalid_reason: str | None
+    updated_at: str | None
+
+
+class AdoptIn(BaseModel):
+    """采纳请求：目标接收号 + 查询候选/目录时拿到的版本号（乐观并发）。"""
+
+    receipt_id: str = Field(..., min_length=1, max_length=64, description="要采纳为正式原包的接收号")
+    expected_version: int = Field(..., ge=0, description="查询时的目录版本；过期版本提交将被 409 拒绝")

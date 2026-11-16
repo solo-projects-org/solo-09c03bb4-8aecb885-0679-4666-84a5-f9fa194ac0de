@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 
-from fastapi import BackgroundTasks, FastAPI, Query, Request, status
+from fastapi import BackgroundTasks, FastAPI, Path, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 
@@ -19,6 +19,10 @@ from .config import Settings, load_settings
 from .db import Database
 from .errors import ObsError
 from .schemas import (
+    AdoptIn,
+    CandidateListOut,
+    CandidateOut,
+    CatalogOut,
     DeclarationIn,
     QuotaOut,
     ReceiptOut,
@@ -28,10 +32,13 @@ from .schemas import (
 from .service import (
     _offload,
     abort_receipt,
+    adopt_station_day_receipt,
     declare_receipt,
     delete_receipt,
     get_quota,
     get_receipt,
+    get_station_day_catalog,
+    list_catalog_candidates,
     list_receipts,
     shutdown_io_pool,
     upload_package,
@@ -76,15 +83,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="海洋数仓 · 浮标观测包接收 API",
+    title="海洋数仓 · 浮标观测包接收与站日目录 API",
     description=(
-        "浮标站每日 Parquet 观测包入湖接收服务。\n\n"
-        "流程：按接收号 **声明**（站号、UTC 日期、长度、SHA-256）→ "
+        "浮标站每日 Parquet 观测包入湖接收服务，并为分析员提供站日正式目录与采纳能力。\n\n"
+        "**接收流程**：按接收号 **声明**（站号、UTC 日期、长度、SHA-256）→ "
         "**上传原包** → 长度/摘要/Parquet 内容全部通过后发布。\n\n"
         "- 同号同声明重试沿用原记录，异声明拒绝（409）；\n"
         "- 相同内容跨接收只存一份（内容寻址），不重复占额；\n"
         "- 空间不足返回 507；校验失败无可下载成品；\n"
-        "- 双实例共享存储，崩溃残留由启动与周期对账自动回收。"
+        "- 双实例共享存储，崩溃残留由启动与周期对账自动回收。\n\n"
+        "**站日目录 / 采纳**：\n"
+        "- `GET .../candidates` 查看本站日仍已发布的候选（接收号、摘要、行数）与目录版本；\n"
+        "- `POST .../adoptions` 采纳正式原包，必须回传查询时的版本号，"
+        "候选或选择变化后旧版本提交一律 409 且不改当前选择；\n"
+        "- 正式接收被删除、或对账发现共享原件缺失 → 目录置 **INVALID**，不自动改选；\n"
+        "- 同号接收删除后重新入湖即使摘要相同也须重新采纳（入湖代次 seq 递增）。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -232,6 +245,87 @@ async def abort(receipt_id: str) -> ReceiptOut:
 async def remove(receipt_id: str):
     await _offload(delete_receipt, settings, db, receipt_id)
     return JSONResponse(status_code=status.HTTP_204_NO_CONTENT, content=None)
+
+
+_DATE = r"^\d{4}-\d{2}-\d{2}$"
+
+
+@app.get(
+    "/catalogs/stations/{station_id}/days/{obs_date}/candidates",
+    response_model=CandidateListOut,
+    tags=["站日目录"],
+    summary="查询站日候选目录（接收号、摘要、行数 + 当前目录版本）",
+)
+async def catalog_candidates(
+    station_id: str,
+    obs_date: str = Path(..., pattern=_DATE, description="观测 UTC 日期 YYYY-MM-DD"),
+) -> CandidateListOut:
+    rows = await _offload(list_catalog_candidates, db, station_id, obs_date)
+    catalog = await _offload(get_station_day_catalog, settings, db, station_id, obs_date)
+    return CandidateListOut(
+        station_id=station_id,
+        obs_date=obs_date,
+        version=catalog["version"],
+        catalog_state=catalog["state"],
+        candidates=[CandidateOut(**r) for r in rows],
+    )
+
+
+@app.get(
+    "/catalogs/stations/{station_id}/days/{obs_date}",
+    response_model=CatalogOut,
+    tags=["站日目录"],
+    summary="查询站日正式目录（正式原包、版本与失效状态）",
+)
+async def catalog_detail(
+    station_id: str,
+    obs_date: str = Path(..., pattern=_DATE, description="观测 UTC 日期 YYYY-MM-DD"),
+) -> CatalogOut:
+    row = await _offload(get_station_day_catalog, settings, db, station_id, obs_date)
+    return CatalogOut(
+        station_id=station_id,
+        obs_date=obs_date,
+        version=row["version"],
+        state=row["state"],
+        adopted_receipt_id=row["adopted_receipt_id"],
+        adopted_seq=row["adopted_seq"],
+        adopted_sha256=row["adopted_sha256"],
+        invalid_reason=row["invalid_reason"],
+        updated_at=row["updated_at"],
+    )
+
+
+@app.post(
+    "/catalogs/stations/{station_id}/days/{obs_date}/adoptions",
+    response_model=CatalogOut,
+    tags=["站日目录"],
+    summary="采纳正式原包（须携带查询时的目录版本，旧版本提交拒绝且不改选择）",
+)
+async def catalog_adopt(
+    station_id: str,
+    body: AdoptIn,
+    obs_date: str = Path(..., pattern=_DATE, description="观测 UTC 日期 YYYY-MM-DD"),
+) -> CatalogOut:
+    row = await _offload(
+        adopt_station_day_receipt,
+        settings,
+        db,
+        station_id,
+        obs_date,
+        body.receipt_id,
+        body.expected_version,
+    )
+    return CatalogOut(
+        station_id=station_id,
+        obs_date=obs_date,
+        version=row["version"],
+        state=row["state"],
+        adopted_receipt_id=row["adopted_receipt_id"],
+        adopted_seq=row["adopted_seq"],
+        adopted_sha256=row["adopted_sha256"],
+        invalid_reason=row["invalid_reason"],
+        updated_at=row["updated_at"],
+    )
 
 
 @app.get("/quota", response_model=QuotaOut, tags=["运维"], summary="查询字节额度占用")

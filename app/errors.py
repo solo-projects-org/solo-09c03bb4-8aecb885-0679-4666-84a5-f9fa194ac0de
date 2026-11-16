@@ -56,3 +56,29 @@ class InvalidPackage(ObsError):
 class AlreadyFinalized(ObsError):
     status_code = 409
     code = "already_finalized"
+
+
+class CatalogVersionConflict(ObsError):
+    """提交时携带的目录版本与当前版本不一致：候选或正式选择已变化。"""
+
+    status_code = 409
+    code = "catalog_version_conflict"
+
+
+class CatalogNotFound(ObsError):
+    status_code = 404
+    code = "catalog_not_found"
+
+
+class AdoptNotPublished(ObsError):
+    """采纳目标接收在本站日已不再是已发布状态（被删除或回退）。"""
+
+    status_code = 409
+    code = "adopt_not_published"
+
+
+class CatalogInvalid(ObsError):
+    """目录已失效（正式接收被删除或共享原件缺失），只能重新采纳，不能自动改选。"""
+
+    status_code = 409
+    code = "catalog_invalid"

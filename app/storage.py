@@ -213,7 +213,8 @@ def reconcile(settings: Settings, db: Database) -> dict[str, int]:
             # 3：缺件的“已发布”记录回退为可重传
             for receipt_id in published_missing:
                 row = conn.execute(
-                    "SELECT blob_sha256 FROM receipts WHERE receipt_id = ?",
+                    "SELECT receipt_id, blob_sha256, station_id, obs_date, seq "
+                    "FROM receipts WHERE receipt_id = ?",
                     (receipt_id,),
                 ).fetchone()
                 sha = row["blob_sha256"] if row else None
@@ -231,6 +232,34 @@ def reconcile(settings: Settings, db: Database) -> dict[str, int]:
                     (receipt_id,),
                 )
                 reset_receipts += 1
+                if row is not None:
+                    # 局部导入避免 storage <-> catalog 模块级循环依赖
+                    from . import catalog as cat
+
+                    catalog_row = conn.execute(
+                        "SELECT * FROM catalogs WHERE station_id = ? AND obs_date = ?",
+                        (row["station_id"], row["obs_date"]),
+                    ).fetchone()
+                    adopted_is_this = (
+                        catalog_row is not None
+                        and catalog_row["state"] == cat.ACTIVE
+                        and catalog_row["adopted_receipt_id"] == receipt_id
+                        and int(catalog_row["adopted_seq"]) == int(row["seq"])
+                    )
+                    reason = (
+                        f"对账发现正式接收 {receipt_id} 的共享原件"
+                        f"（sha256={sha}）缺失，目录失效，需重新采纳"
+                    )
+                    if adopted_is_this:
+                        # 正式原包缺件：目录失效且不自动改选
+                        cat.mark_catalog_invalid(
+                            conn, row["station_id"], row["obs_date"], reason
+                        )
+                    else:
+                        # 仅候选集变化：推进版本，旧版本采纳提交将被拒绝
+                        cat.bump_catalog_version(
+                            conn, row["station_id"], row["obs_date"]
+                        )
 
             # 4 & 5：blob 对账（以磁盘为准）
             db_shas = {r["sha256"]: r for r in conn.execute("SELECT * FROM blobs").fetchall()}
